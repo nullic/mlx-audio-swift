@@ -58,7 +58,7 @@ public func mossTTSSampleToken(
     doSample: Bool = true
 ) -> MLXArray {
     var scores = mossTTSApplyRepetitionPenaltyDelayPattern(
-        logits: logits,
+        logits: logits.asType(.float32),
         previousTokens: previousTokens,
         penalty: repetitionPenalty
     )
