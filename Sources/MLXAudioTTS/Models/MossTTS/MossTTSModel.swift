@@ -830,7 +830,20 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         )
 
         let weights = try loadWeights(from: modelDir)
-        try model.update(parameters: ModuleParameters.unflattened(model.sanitize(weights: weights)), verify: .all)
+        let sanitized = model.sanitize(weights: weights)
+        // Quantized checkpoints: re-apply the quantization the weights carry
+        // (any module whose weights include `.scales`) before loading. Dense
+        // layers (lm_heads, emb_ext) have no scales and stay full-precision.
+        if let configObject = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
+           let quant = configObject["quantization"] as? [String: Any],
+           let groupSize = quant["group_size"] as? Int,
+           let bits = quant["bits"] as? Int
+        {
+            quantize(model: model, groupSize: groupSize, bits: bits) { path, _ in
+                sanitized["\(path).scales"] != nil
+            }
+        }
+        try model.update(parameters: ModuleParameters.unflattened(sanitized), verify: .all)
         eval(model)
 
         model.tokenizer = try await MossTTSTokenizerAdapter.fromModelDirectory(modelDir)
