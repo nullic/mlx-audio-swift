@@ -110,6 +110,13 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
+                // `Hub` is a separate product of swift-transformers — the
+                // `Transformers` umbrella is Tokenizers + Generation + Models
+                // and does NOT carry it. This target uses `HubApi`, which
+                // links fine while it is built statically and fails with
+                // undefined symbols the moment SPM builds it as a dynamic
+                // framework — which is what a consumer's test build does.
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/MLXAudioTTS",
             exclude: [
@@ -207,6 +214,13 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
+                // `Hub` is a separate product of swift-transformers — the
+                // `Transformers` umbrella is Tokenizers + Generation + Models
+                // and does NOT carry it. This target uses `HubApi`, which
+                // links fine while it is built statically and fails with
+                // undefined symbols the moment SPM builds it as a dynamic
+                // framework — which is what a consumer's test build does.
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/MLXAudioSTS",
             exclude: [
