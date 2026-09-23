@@ -148,6 +148,10 @@ let package = Package(
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
                 .product(name: "Transformers", package: "swift-transformers"),
+                // Same as MLXAudioTTS: GLM-ASR builds its tokenizer through
+                // `AutoTokenizer.from(modelFolder:hubApi:)`, whose default
+                // `HubApi` lives in swift-transformers' separate `Hub` product.
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/MLXAudioSTT",
             exclude: [
