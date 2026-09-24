@@ -385,7 +385,8 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         audioTemperature: Float = 1.7,
         audioTopP: Float = 0.8,
         audioTopK: Int = 25,
-        audioRepetitionPenalty: Float = 1.0
+        audioRepetitionPenalty: Float = 1.0,
+        onStep: ((MLXArray) throws -> Void)? = nil
     ) throws -> [(startLength: Int, generationIDs: MLXArray)] {
         guard inputIDs.ndim == 3 else {
             throw AudioGenerationError.invalidInput("Expected input_ids rank 3, got \(inputIDs.shape)")
@@ -539,6 +540,7 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
             currentInputIDs = MLX.concatenated([nextTextToken, nextAudioTokens], axis: 2)
             generationIDs = MLX.concatenated([generationIDs, currentInputIDs], axis: 1)
             eval(currentInputIDs)
+            try onStep?(generationIDs[0])
 
             if isStopping { break }
         }
@@ -725,6 +727,98 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         generationParameters: GenerateParameters
     ) async throws -> MLXArray {
         _ = voice
+        let inputIDs = try await promptIDs(text: text, refAudio: refAudio, refText: refText, language: language)
+        let outputs: [(startLength: Int, generationIDs: MLXArray)]
+        if config.isLocalTransformer {
+            outputs = try generateLocalIDs(
+                inputIDs: inputIDs,
+                maxNewTokens: generationParameters.maxTokens ?? 4_096,
+                audioTemperature: generationParameters.temperature,
+                audioTopP: generationParameters.topP,
+                audioTopK: generationParameters.topK,
+                audioRepetitionPenalty: generationParameters.repetitionPenalty ?? 1.1
+            )
+        } else {
+            outputs = try delayPatternIDs(inputIDs: inputIDs, generationParameters: generationParameters)
+        }
+        return try decodeGeneratedAudio(outputs).audio
+    }
+
+    private func delayPatternIDs(
+        inputIDs: MLXArray,
+        generationParameters: GenerateParameters,
+        onStep: ((MLXArray) throws -> Void)? = nil
+    ) throws -> [(startLength: Int, generationIDs: MLXArray)] {
+        try generateDelayPatternIDs(
+            inputIDs: inputIDs,
+            maxNewTokens: generationParameters.maxTokens ?? generationConfig.maxNewTokens ?? 4_096,
+            textTemperature: generationConfig.temperature ?? 1.5,
+            textTopP: generationConfig.topP ?? 1.0,
+            textTopK: 50,
+            audioTemperature: generationParameters.temperature,
+            audioTopP: generationParameters.topP,
+            audioTopK: generationParameters.topK,
+            audioRepetitionPenalty: generationParameters.repetitionPenalty ?? generationConfig.repetitionPenalty ?? 1.0,
+            onStep: onStep
+        )
+    }
+
+    /// Streams the audio while it is generated: every `streamingInterval`
+    /// seconds of finished frames are decoded and yielded, so the first sound
+    /// comes after the delay pattern fills, not after the whole utterance.
+    public func generateStream(
+        text: String,
+        voice: String?,
+        refAudio: MLXArray?,
+        refText: String?,
+        language: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        _ = voice
+        return AsyncThrowingStream { continuation in
+            let task = Task { @Sendable in
+                do {
+                    let inputIDs = try await self.promptIDs(text: text, refAudio: refAudio, refText: refText, language: language)
+                    guard !self.config.isLocalTransformer, let codec = self.audioTokenizer as? MLXMossAudioTokenizer else {
+                        let outputs = try self.config.isLocalTransformer
+                            ? self.generateLocalIDs(inputIDs: inputIDs, maxNewTokens: generationParameters.maxTokens ?? 4_096)
+                            : self.delayPatternIDs(inputIDs: inputIDs, generationParameters: generationParameters)
+                        continuation.yield(.audio(try self.decodeGeneratedAudio(outputs).audio))
+                        continuation.finish()
+                        return
+                    }
+                    let framesPerSecond = Double(codec.sampleRate) / Double(codec.downsampleRate)
+                    let startIndex = Self.promptStart(of: inputIDs, imStartTokenID: self.config.imStartTokenID)
+                    let streamer = MossTTSAudioStreamer(
+                        startIndex: startIndex,
+                        trim: inputIDs.dim(1) - startIndex,
+                        codebooks: self.config.nVQ,
+                        padCode: Int32(self.config.audioPadCode),
+                        framesPerChunk: max(1, Int((streamingInterval * framesPerSecond).rounded())),
+                        decoder: { try codec.decodeStream(numQuantizers: self.config.nVQ) },
+                        emit: { continuation.yield(.audio($0)) }
+                    )
+                    _ = try self.delayPatternIDs(inputIDs: inputIDs, generationParameters: generationParameters) { generated in
+                        try Task.checkCancellation()
+                        try streamer.advance(generated)
+                    }
+                    try streamer.finish()
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { @Sendable _ in task.cancel() }
+        }
+    }
+
+    private static func promptStart(of inputIDs: MLXArray, imStartTokenID: Int) -> Int {
+        let start = findLastEqual(inputIDs[0, 0..., 0], target: imStartTokenID)
+        return start != -1 ? start + 3 : inputIDs.dim(1)
+    }
+
+    private func promptIDs(text: String, refAudio: MLXArray?, refText: String?, language: String?) async throws -> MLXArray {
         guard let tokenizer else {
             throw AudioGenerationError.modelNotInitialized("MOSS tokenizer is not initialized")
         }
@@ -756,31 +850,7 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
             ]]
         }
 
-        let batch = try processor(conversations, mode: mode)
-        let outputs: [(startLength: Int, generationIDs: MLXArray)]
-        if config.isLocalTransformer {
-            outputs = try generateLocalIDs(
-                inputIDs: batch.inputIDs,
-                maxNewTokens: generationParameters.maxTokens ?? 4_096,
-                audioTemperature: generationParameters.temperature,
-                audioTopP: generationParameters.topP,
-                audioTopK: generationParameters.topK,
-                audioRepetitionPenalty: generationParameters.repetitionPenalty ?? 1.1
-            )
-        } else {
-            outputs = try generateDelayPatternIDs(
-                inputIDs: batch.inputIDs,
-                maxNewTokens: generationParameters.maxTokens ?? generationConfig.maxNewTokens ?? 4_096,
-                textTemperature: generationConfig.temperature ?? 1.5,
-                textTopP: generationConfig.topP ?? 1.0,
-                textTopK: 50,
-                audioTemperature: generationParameters.temperature,
-                audioTopP: generationParameters.topP,
-                audioTopK: generationParameters.topK,
-                audioRepetitionPenalty: generationParameters.repetitionPenalty ?? generationConfig.repetitionPenalty ?? 1.0
-            )
-        }
-        return try decodeGeneratedAudio(outputs).audio
+        return try processor(conversations, mode: mode).inputIDs
     }
 
     public func generateStream(

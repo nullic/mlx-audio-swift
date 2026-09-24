@@ -373,6 +373,51 @@ private final class MossAudioMultiheadAttention: Module {
         out = out.transposed(0, 2, 1, 3).reshaped(batch, time, embedDim)
         return outProj(out)
     }
+
+    /// The same attention over frames that arrive a few at a time: keys and
+    /// values of earlier frames stay in `cache`, positions keep counting, and
+    /// only the last `context` keys are kept — exactly what the full-length
+    /// mask lets a query see, so the output matches a decode of the whole.
+    func callAsFunction(_ x: MLXArray, cache: MossAudioAttentionCache) -> MLXArray {
+        let batch = x.dim(0)
+        let time = x.dim(1)
+        let qkv = inProj(x).reshaped(batch, time, 3, numHeads, headDim)
+        var q = qkv[0..., 0..., 0, 0..., 0...].transposed(0, 2, 1, 3)
+        var k = qkv[0..., 0..., 1, 0..., 0...].transposed(0, 2, 1, 3)
+        var v = qkv[0..., 0..., 2, 0..., 0...].transposed(0, 2, 1, 3)
+        if useRoPE {
+            (q, k) = mossApplyAudioRoPE(q: q, k: k, maxPeriod: maxPeriod, offset: cache.position)
+        }
+        if let keys = cache.keys, let values = cache.values {
+            k = MLX.concatenated([keys, k], axis: 2)
+            v = MLX.concatenated([values, v], axis: 2)
+        }
+        let past = k.dim(2) - time
+        let delta = (MLXArray(0 ..< time).asType(.int32) + MLXArray(Int32(past))).reshaped([1, 1, time, 1])
+            - MLXArray(0 ..< k.dim(2)).asType(.int32).reshaped([1, 1, 1, k.dim(2)])
+        var allowed = delta .>= MLXArray(Int32(0))
+        if let context {
+            allowed = logicalAnd(allowed, delta .< MLXArray(Int32(context)))
+        }
+        let minimum = MLXArray(Float(x.dtype.finfo?.min ?? -Double.greatestFiniteMagnitude))
+        let mask = MLX.where(allowed, MLXArray(0.0), minimum).asType(x.dtype)
+        var out = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: mask)
+        out = out.transposed(0, 2, 1, 3).reshaped(batch, time, embedDim)
+        if let context, k.dim(2) > context {
+            k = k[0..., 0..., (k.dim(2) - context)..., 0...]
+            v = v[0..., 0..., (v.dim(2) - context)..., 0...]
+        }
+        cache.keys = k
+        cache.values = v
+        cache.position += time
+        return outProj(out)
+    }
+}
+
+final class MossAudioAttentionCache {
+    var keys: MLXArray?
+    var values: MLXArray?
+    var position = 0
 }
 
 private final class MossAudioTransformerLayer: Module {
@@ -430,6 +475,15 @@ private final class MossAudioTransformerLayer: Module {
         let fcOut = ffn[2] as! Linear
         let mlpOut = fcOut(mossExactGELU(fcIn(mlpInput)))
         hidden = hidden + mossApplyLayerScale(layerScale2, to: mlpOut)
+        return hidden
+    }
+
+    func callAsFunction(_ x: MLXArray, cache: MossAudioAttentionCache) -> MLXArray {
+        let attended = selfAttention(norm1(x), cache: cache)
+        var hidden = x + mossApplyLayerScale(layerScale1, to: attended)
+        let fcIn = ffn[0] as! Linear
+        let fcOut = ffn[2] as! Linear
+        hidden = hidden + mossApplyLayerScale(layerScale2, to: fcOut(mossExactGELU(fcIn(norm2(hidden)))))
         return hidden
     }
 }
@@ -491,6 +545,18 @@ private final class MossAudioTransformer: Module {
         }
         return hidden
     }
+
+    var streams: Bool {
+        !["sin", "sin_rope"].contains(positionalEmbedding) && layers.allSatisfy(\.selfAttention.causal)
+    }
+
+    func callAsFunction(_ x: MLXArray, caches: [MossAudioAttentionCache]) -> MLXArray {
+        var hidden = x
+        for (layer, cache) in zip(layers, caches) {
+            hidden = layer(hidden, cache: cache)
+        }
+        return hidden
+    }
 }
 
 private final class MossProjectedTransformer: Module, MossAudioTokenizerStage {
@@ -531,6 +597,10 @@ private final class MossProjectedTransformer: Module, MossAudioTokenizerStage {
         hidden = transformer(hidden, inputLengths: inputLengths)
         let output = mossAudioCallUnary(outputProj, hidden)
         return (output.transposed(0, 2, 1), inputLengths)
+    }
+    func callAsFunction(_ x: MLXArray, caches: [MossAudioAttentionCache]) -> MLXArray {
+        let hidden = transformer(mossAudioCallUnary(inputProj, x.transposed(0, 2, 1)), caches: caches)
+        return mossAudioCallUnary(outputProj, hidden).transposed(0, 2, 1)
     }
 }
 
@@ -976,7 +1046,7 @@ public final class MLXMossAudioTokenizer: Module, MossAudioTokenizing, @unchecke
         return (values, lengths)
     }
 
-    private func restoreChannelsFromCodec(
+    fileprivate func restoreChannelsFromCodec(
         outputValues: MLXArray,
         outputLengths: MLXArray
     ) -> (MLXArray, MLXArray) {
@@ -1044,6 +1114,13 @@ public final class MLXMossAudioTokenizer: Module, MossAudioTokenizing, @unchecke
         return encoded.0[0..., 0, 0..<codeLength].transposed(1, 0).asType(.int32)
     }
 
+    /// A decoder that takes codes a few frames at a time and returns the audio
+    /// of just those frames — the same samples `decodeAudioCodes` gives for the
+    /// whole run, since every stage is causal.
+    public func decodeStream(numQuantizers: Int) throws -> MossAudioDecodeStream {
+        try MossAudioDecodeStream(tokenizer: self, numQuantizers: numQuantizers)
+    }
+
     public func decodeAudioCodes(_ audioTokenIDs: MLXArray, numQuantizers: Int) throws -> MLXArray {
         var codes = audioTokenIDs.asType(.int32)
         if codes.ndim == 3 {
@@ -1067,5 +1144,45 @@ public final class MLXMossAudioTokenizer: Module, MossAudioTokenizing, @unchecke
         eval(decoded.0, decoded.1)
         let audioLength = decoded.1.asArray(Int32.self).first.map(Int.init) ?? decoded.0.dim(2)
         return decoded.0[0, 0..., 0..<audioLength].transposed(1, 0).asType(.float32)
+    }
+}
+
+public final class MossAudioDecodeStream {
+    private let tokenizer: MLXMossAudioTokenizer
+    private let numQuantizers: Int
+    private let caches: [[MossAudioAttentionCache]]
+
+    fileprivate init(tokenizer: MLXMossAudioTokenizer, numQuantizers: Int) throws {
+        self.tokenizer = tokenizer
+        self.numQuantizers = numQuantizers
+        self.caches = try tokenizer.decoder.map { module in
+            guard let stage = module as? MossProjectedTransformer else { return [] }
+            guard stage.transformer.streams else {
+                throw MossAudioTokenizerError.notImplemented("This MOSS audio tokenizer cannot decode in pieces.")
+            }
+            return stage.transformer.layers.map { _ in MossAudioAttentionCache() }
+        }
+    }
+
+    /// `codes` is `[frames, nq]`; the result is `[samples, channels]`.
+    public func decode(_ codes: MLXArray) throws -> MLXArray {
+        guard codes.dim(0) > 0 else {
+            return MLXArray.zeros([0, tokenizer.channels], dtype: .float32)
+        }
+        let effectiveNQ = min(numQuantizers, codes.dim(1))
+        let stacked = codes[0..., 0..<effectiveNQ].asType(.int32).transposed(1, 0).expandedDimensions(axis: 1)
+        var audio = tokenizer.quantizer.decodeCodes(stacked)
+        var lengths = MLXArray([Int32(codes.dim(0))])
+        for (module, stageCaches) in zip(tokenizer.decoder, caches) {
+            if let stage = module as? MossProjectedTransformer {
+                audio = stage(audio, caches: stageCaches)
+            } else {
+                (audio, lengths) = try (module as! MossAudioTokenizerStage)(audio, inputLengths: lengths)
+            }
+        }
+        let restored = tokenizer.restoreChannelsFromCodec(outputValues: audio, outputLengths: lengths)
+        let samples = restored.0[0].transposed(1, 0).asType(.float32)
+        eval(samples)
+        return samples
     }
 }
