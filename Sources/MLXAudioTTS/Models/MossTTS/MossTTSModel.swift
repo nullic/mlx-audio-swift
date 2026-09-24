@@ -479,23 +479,39 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
             }
 
             var nextAudioValues = Array(repeating: Int32(config.audioPadCode), count: batchSize * nVQ)
-            for codebookIndex in 0 ..< nVQ {
+            let activeCodebooks = (0 ..< nVQ).filter { codebookIndex in
                 let preAudio = audioLengths > codebookIndex
                 let postAudio = delayedLengths == Int.max ? true : codebookIndex > delayedLengths - 1
-                guard preAudio && postAudio else { continue }
-
-                var channelLogits = nextTokenLogits[codebookIndex + 1]
-                channelLogits = Self.setLogitsToNegInf(channelLogits, tokenIDs: [config.audioPadCode])
-                let channelToken = mossTTSSampleToken(
-                    logits: channelLogits,
-                    previousTokens: generationIDs[0..., 0..., codebookIndex + 1],
-                    repetitionPenalty: audioRepetitionPenalty,
+                return preAudio && postAudio
+            }
+            if audioRepetitionPenalty == 1.0, !activeCodebooks.isEmpty {
+                let stacked = concatenated(activeCodebooks.map { nextTokenLogits[$0 + 1] }, axis: 0)
+                let masked = Self.setLogitsToNegInf(stacked, tokenIDs: [config.audioPadCode])
+                let tokens = mossTTSSampleToken(
+                    logits: masked,
                     topP: audioTopP,
                     topK: audioTopK,
                     doSample: audioDoSample
                 )
-                eval(channelToken)
-                nextAudioValues[codebookIndex] = Int32(channelToken.item(Int.self))
+                eval(tokens)
+                for (row, token) in zip(activeCodebooks, tokens.asArray(Int32.self)) {
+                    nextAudioValues[row] = token
+                }
+            } else {
+                for codebookIndex in activeCodebooks {
+                    var channelLogits = nextTokenLogits[codebookIndex + 1]
+                    channelLogits = Self.setLogitsToNegInf(channelLogits, tokenIDs: [config.audioPadCode])
+                    let channelToken = mossTTSSampleToken(
+                        logits: channelLogits,
+                        previousTokens: generationIDs[0..., 0..., codebookIndex + 1],
+                        repetitionPenalty: audioRepetitionPenalty,
+                        topP: audioTopP,
+                        topK: audioTopK,
+                        doSample: audioDoSample
+                    )
+                    eval(channelToken)
+                    nextAudioValues[codebookIndex] = Int32(channelToken.item(Int.self))
+                }
             }
 
             if [
