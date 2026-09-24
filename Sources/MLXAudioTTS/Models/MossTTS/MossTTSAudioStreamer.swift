@@ -1,3 +1,4 @@
+import Foundation
 @preconcurrency import MLX
 import MLXAudioCodecs
 
@@ -22,6 +23,18 @@ final class MossTTSAudioStreamer {
     private var decoder: MossAudioDecodeStream?
     private var inSegment = false
     private var finishedSegments = 0
+    private var emitted = 0
+
+    /// The prompt's frames go with the first chunk, so the codec reads them in
+    /// the same call; after that each chunk grows by half, up to two seconds —
+    /// a decode costs about the same for five frames as for twenty-five, and
+    /// half again is what the next chunk can be made in while this one plays.
+    private var chunk: Int {
+        guard trim == 0 else { return trim + framesPerChunk }
+        return min(Int((Double(framesPerChunk) * pow(1.5, Double(min(emitted, 6)))).rounded()), Self.longestChunk)
+    }
+
+    private static let longestChunk = 25
 
     init(
         startIndex: Int,
@@ -41,18 +54,16 @@ final class MossTTSAudioStreamer {
         self.emit = emit
     }
 
-    /// `generated` is the whole generation so far, `[rows, 1 + codebooks]`.
-    func advance(_ generated: MLXArray) throws {
-        let finished = generated.dim(0) - startIndex - codebooks + 1
+    /// `rows` is the whole generation so far, flattened `[rows, 1 + codebooks]`.
+    func advance(_ rows: [Int32]) throws {
+        let width = codebooks + 1
+        let finished = rows.count / width - startIndex - codebooks + 1
         if finished > examined {
-            let rows = generated[(startIndex + examined) ..< (startIndex + finished + codebooks - 1), 1...]
-                .asType(.int32)
-                .asArray(Int32.self)
-            for frame in 0 ..< (finished - examined) {
+            for frame in examined ..< finished {
                 var codes = [Int32](repeating: 0, count: codebooks)
                 var padding = true
                 for codebook in 0 ..< codebooks {
-                    let code = rows[(frame + codebook) * codebooks + codebook]
+                    let code = rows[(startIndex + frame + codebook) * width + 1 + codebook]
                     codes[codebook] = code
                     if code != padCode { padding = false }
                 }
@@ -66,7 +77,7 @@ final class MossTTSAudioStreamer {
             }
             examined = finished
         }
-        if pendingFrames >= framesPerChunk { try flush() }
+        if pendingFrames >= chunk { try flush() }
     }
 
     func finish() throws {
@@ -93,6 +104,9 @@ final class MossTTSAudioStreamer {
         }
         pending.removeAll(keepingCapacity: true)
         pendingFrames = 0
-        if audio.dim(0) > 0 { emit(audio) }
+        if audio.dim(0) > 0 {
+            emitted += 1
+            emit(audio)
+        }
     }
 }

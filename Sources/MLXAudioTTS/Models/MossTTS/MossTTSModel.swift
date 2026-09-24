@@ -81,6 +81,15 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
     public var audioTokenizer: MossAudioTokenizing?
     private var hfToken: String?
     private var cache: HubCache = .default
+    private let delayStepMemo = MossTTSDelayStep.Memo()
+    private let referenceMemo = ReferenceMemo()
+
+    /// The codes of the last reference voice: a caller that keeps one voice
+    /// passes the same array every time, and encoding it is not free.
+    private final class ReferenceMemo {
+        var audio: MLXArray?
+        var codes: MLXArray?
+    }
 
     public var sampleRate: Int { config.samplingRate }
 
@@ -386,7 +395,7 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         audioTopP: Float = 0.8,
         audioTopK: Int = 25,
         audioRepetitionPenalty: Float = 1.0,
-        onStep: ((MLXArray) throws -> Void)? = nil
+        onStep: (([Int32]) throws -> Void)? = nil
     ) throws -> [(startLength: Int, generationIDs: MLXArray)] {
         guard inputIDs.ndim == 3 else {
             throw AudioGenerationError.invalidInput("Expected input_ids rank 3, got \(inputIDs.shape)")
@@ -402,7 +411,6 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         let audioDoSample = audioTemperature > 0
         if !audioDoSample { audioTemperature = 1 }
 
-        let batchSize = inputIDs.dim(0)
         let seqLen = inputIDs.dim(1)
         let width = inputIDs.dim(2)
         let nVQ = width - 1
@@ -411,13 +419,13 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         }
 
         let cache = makeCache()
-        var currentInputIDs = inputIDs
-        var generationIDs = inputIDs
+        let currentInputIDs = inputIDs
+        var rows = inputIDs[0].asType(.int32).asArray(Int32.self)
         var isStopping = false
         var audioLengths = 0
         var delayedLengths = Int.max
 
-        let lastTextToken = inputIDs[0, -1, 0].item(Int.self)
+        let lastTextToken = Int(rows[(seqLen - 1) * width])
         let isContinuation = lastTextToken == config.audioStartTokenID
             || lastTextToken == config.audioAssistantGenSlotTokenID
         let audioStartIndex = Self.findLastEqual(inputIDs[0, 0..., 0], target: config.audioStartTokenID)
@@ -436,40 +444,88 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
             config.audioAssistantGenSlotTokenID,
             config.audioAssistantDelaySlotTokenID,
         ]
+        let heads = try delayStep()
+        var stepTokens: [Int32]?
 
         for timeStep in 0 ..< maxNewTokens {
-            let outputs = try self(inputIDs: currentInputIDs, cache: cache)
-            let nextTokenLogits = outputs.enumerated().map { index, logits in
-                logits[0..., -1, 0...] / MLXArray(index == 0 ? textTemperature : audioTemperature)
+            guard let languageModel else {
+                throw AudioGenerationError.modelNotInitialized("MOSS language model is not initialized")
             }
+            let embeddings = try stepTokens.map(heads.embed) ?? buildInputsEmbeds(currentInputIDs)
+            let hidden = try languageModel(inputEmbeddings: embeddings, cache: cache)[0..., -1, 0...]
 
-            var nextTextTokenValue = config.padTokenID
+            var textToken: MLXArray?
+            var forcedText = config.padTokenID
             if !isStopping && delayedLengths < nVQ {
-                nextTextTokenValue = config.audioAssistantDelaySlotTokenID
+                forcedText = config.audioAssistantDelaySlotTokenID
             } else if !isStopping && delayedLengths == nVQ {
-                nextTextTokenValue = config.audioEndTokenID
+                forcedText = config.audioEndTokenID
                 isAudio = false
             } else if !isStopping && delayedLengths > nVQ {
-                var textLogits = nextTokenLogits[0]
                 if isAudio {
-                    textLogits = Self.keepOnlyLogits(textLogits, tokenIDs: textKeepInsideAudio)
+                    var logits = heads.insideAudioText(hidden) / MLXArray(textTemperature)
+                    if timeStep == 0 {
+                        logits = Self.setLogitsToNegInf(logits, tokenIDs: [1])
+                    }
+                    let picked = textDoSample ? MLXRandom.categorical(logits.asType(.float32)) : argMax(logits, axis: -1)
+                    textToken = MLXArray(textKeepInsideAudio.map(Int32.init))[picked.reshaped([1])]
                 } else {
+                    var textLogits = lmHeads[0](hidden) / MLXArray(textTemperature)
                     textLogits = Self.setLogitsToNegInf(textLogits, tokenIDs: textExcludeOutsideAudio)
+                    if timeStep == 0 {
+                        textLogits = Self.setLogitsToNegInf(textLogits, tokenIDs: [config.audioAssistantDelaySlotTokenID])
+                    }
+                    if timeStep <= nVQ {
+                        textLogits = Self.setLogitsToNegInf(textLogits, tokenIDs: [config.imEndTokenID])
+                    }
+                    textToken = mossTTSSampleToken(
+                        logits: textLogits,
+                        topP: textTopP,
+                        topK: textTopK,
+                        doSample: textDoSample
+                    ).reshaped([1])
                 }
-                if timeStep == 0 {
-                    textLogits = Self.setLogitsToNegInf(textLogits, tokenIDs: [config.audioAssistantDelaySlotTokenID])
+            }
+
+            let activeCodebooks = (0 ..< nVQ).filter { codebookIndex in
+                let preAudio = audioLengths > codebookIndex
+                let postAudio = delayedLengths == Int.max ? true : codebookIndex > delayedLengths - 1
+                return preAudio && postAudio
+            }
+            var audioTokens: MLXArray?
+            if !activeCodebooks.isEmpty {
+                var logits = heads.audio(hidden, codebooks: activeCodebooks) / MLXArray(audioTemperature)
+                logits = Self.setLogitsToNegInf(logits, tokenIDs: [config.audioPadCode])
+                if audioRepetitionPenalty == 1.0 {
+                    audioTokens = mossTTSSampleToken(
+                        logits: logits,
+                        topP: audioTopP,
+                        topK: audioTopK,
+                        doSample: audioDoSample
+                    ).reshaped([-1])
+                } else {
+                    let history = MLXArray(rows, [rows.count / width, width])
+                    audioTokens = MLX.concatenated(activeCodebooks.enumerated().map { row, codebookIndex in
+                        mossTTSSampleToken(
+                            logits: logits[row ..< (row + 1)],
+                            previousTokens: history[0..., (codebookIndex + 1) ..< (codebookIndex + 2)].reshaped([1, -1]),
+                            repetitionPenalty: audioRepetitionPenalty,
+                            topP: audioTopP,
+                            topK: audioTopK,
+                            doSample: audioDoSample
+                        ).reshaped([1])
+                    }, axis: 0)
                 }
-                if timeStep <= nVQ {
-                    textLogits = Self.setLogitsToNegInf(textLogits, tokenIDs: [config.imEndTokenID])
+            }
+
+            let drawn = [textToken, audioTokens].compactMap(\.self)
+            if !drawn.isEmpty { eval(drawn) }
+            let nextTextTokenValue = textToken.map { $0.item(Int.self) } ?? forcedText
+            var nextAudioValues = Array(repeating: Int32(config.audioPadCode), count: nVQ)
+            if let audioTokens {
+                for (row, token) in zip(activeCodebooks, audioTokens.asArray(Int32.self)) {
+                    nextAudioValues[row] = token
                 }
-                let token = mossTTSSampleToken(
-                    logits: textLogits,
-                    topP: textTopP,
-                    topK: textTopK,
-                    doSample: textDoSample
-                )
-                eval(token)
-                nextTextTokenValue = token.item(Int.self)
             }
 
             if nextTextTokenValue == config.audioStartTokenID {
@@ -478,43 +534,6 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
             if nextTextTokenValue == config.imEndTokenID {
                 isStopping = true
             }
-
-            var nextAudioValues = Array(repeating: Int32(config.audioPadCode), count: batchSize * nVQ)
-            let activeCodebooks = (0 ..< nVQ).filter { codebookIndex in
-                let preAudio = audioLengths > codebookIndex
-                let postAudio = delayedLengths == Int.max ? true : codebookIndex > delayedLengths - 1
-                return preAudio && postAudio
-            }
-            if audioRepetitionPenalty == 1.0, !activeCodebooks.isEmpty {
-                let stacked = concatenated(activeCodebooks.map { nextTokenLogits[$0 + 1] }, axis: 0)
-                let masked = Self.setLogitsToNegInf(stacked, tokenIDs: [config.audioPadCode])
-                let tokens = mossTTSSampleToken(
-                    logits: masked,
-                    topP: audioTopP,
-                    topK: audioTopK,
-                    doSample: audioDoSample
-                )
-                eval(tokens)
-                for (row, token) in zip(activeCodebooks, tokens.asArray(Int32.self)) {
-                    nextAudioValues[row] = token
-                }
-            } else {
-                for codebookIndex in activeCodebooks {
-                    var channelLogits = nextTokenLogits[codebookIndex + 1]
-                    channelLogits = Self.setLogitsToNegInf(channelLogits, tokenIDs: [config.audioPadCode])
-                    let channelToken = mossTTSSampleToken(
-                        logits: channelLogits,
-                        previousTokens: generationIDs[0..., 0..., codebookIndex + 1],
-                        repetitionPenalty: audioRepetitionPenalty,
-                        topP: audioTopP,
-                        topK: audioTopK,
-                        doSample: audioDoSample
-                    )
-                    eval(channelToken)
-                    nextAudioValues[codebookIndex] = Int32(channelToken.item(Int.self))
-                }
-            }
-
             if [
                 config.audioStartTokenID,
                 config.audioAssistantGenSlotTokenID,
@@ -535,12 +554,10 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
                 delayedLengths = Int.max
             }
 
-            let nextTextToken = MLXArray([Int32(nextTextTokenValue)], [batchSize, 1, 1]).asType(.int32)
-            let nextAudioTokens = MLXArray(nextAudioValues, [batchSize, 1, nVQ]).asType(.int32)
-            currentInputIDs = MLX.concatenated([nextTextToken, nextAudioTokens], axis: 2)
-            generationIDs = MLX.concatenated([generationIDs, currentInputIDs], axis: 1)
-            eval(currentInputIDs)
-            try onStep?(generationIDs[0])
+            let next = [Int32(nextTextTokenValue)] + nextAudioValues
+            rows += next
+            stepTokens = next
+            try onStep?(rows)
 
             if isStopping { break }
         }
@@ -548,7 +565,24 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         var startIndex = Self.findLastEqual(inputIDs[0, 0..., 0], target: config.imStartTokenID)
         startIndex = startIndex != -1 ? startIndex + 3 : seqLen
         let startLength = seqLen - startIndex
-        return [(startLength, generationIDs[0, startIndex..., 0...])]
+        let generationIDs = MLXArray(rows, [rows.count / width, width])
+        return [(startLength, generationIDs[startIndex..., 0...])]
+    }
+
+    private func delayStep() throws -> MossTTSDelayStep {
+        if let memo = delayStepMemo.value { return memo }
+        guard let languageModel else {
+            throw AudioGenerationError.modelNotInitialized("MOSS language model is not initialized")
+        }
+        let made = MossTTSDelayStep(
+            textEmbedding: languageModel.embedTokens,
+            audioEmbeddings: embExt,
+            text: lmHeads[0],
+            audio: Array(lmHeads.dropFirst()),
+            insideAudio: [config.audioAssistantGenSlotTokenID, config.audioAssistantDelaySlotTokenID]
+        )
+        delayStepMemo.value = made
+        return made
     }
 
     public func generateLocalIDs(
@@ -747,7 +781,7 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
     private func delayPatternIDs(
         inputIDs: MLXArray,
         generationParameters: GenerateParameters,
-        onStep: ((MLXArray) throws -> Void)? = nil
+        onStep: (([Int32]) throws -> Void)? = nil
     ) throws -> [(startLength: Int, generationIDs: MLXArray)] {
         try generateDelayPatternIDs(
             inputIDs: inputIDs,
@@ -799,9 +833,9 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
                         decoder: { try codec.decodeStream(numQuantizers: self.config.nVQ) },
                         emit: { continuation.yield(.audio($0)) }
                     )
-                    _ = try self.delayPatternIDs(inputIDs: inputIDs, generationParameters: generationParameters) { generated in
+                    _ = try self.delayPatternIDs(inputIDs: inputIDs, generationParameters: generationParameters) { rows in
                         try Task.checkCancellation()
-                        try streamer.advance(generated)
+                        try streamer.advance(rows)
                     }
                     try streamer.finish()
                     continuation.finish()
@@ -824,8 +858,14 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
         }
         try await ensureAudioTokenizer()
 
-        let promptAudioCodes = try refAudio.map {
-            try encodeReferenceAudio($0, numQuantizers: config.nVQ)
+        let promptAudioCodes = try refAudio.map { reference in
+            if let known = referenceMemo.codes, referenceMemo.audio === reference { return known }
+            let codes = try encodeReferenceAudio(reference, numQuantizers: config.nVQ)
+            eval(codes)
+            referenceMemo.audio = reference
+            referenceMemo.codes = codes
+            (audioTokenizer as? MLXMossAudioTokenizer)?.releaseEncoder()
+            return codes
         }
         let mode = (refText != nil && promptAudioCodes != nil) ? "continuation" : "generation"
         let processor: MossTTSDelayProcessor = config.isLocalTransformer
