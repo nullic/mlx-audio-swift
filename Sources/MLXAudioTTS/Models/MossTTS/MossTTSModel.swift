@@ -697,7 +697,7 @@ public final class MossTTSModel: Module, SpeechGenerationModel, @unchecked Senda
 
     private func decodeGeneratedAudio(
         _ outputs: [(startLength: Int, generationIDs: MLXArray)]
-    ) throws -> (audio: MLXArray, tokenCount: Int) {
+    ) throws -> sending (audio: MLXArray, tokenCount: Int) {
         var segments: [MLXArray] = []
         var tokenCount = 0
         for output in outputs {

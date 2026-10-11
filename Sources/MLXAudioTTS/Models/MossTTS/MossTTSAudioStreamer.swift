@@ -14,7 +14,7 @@ final class MossTTSAudioStreamer {
     private let padCode: Int32
     private let framesPerChunk: Int
     private let makeDecoder: () throws -> MossAudioDecodeStream
-    private let emit: (MLXArray) -> Void
+    private let emit: (sending MLXArray) -> Void
 
     private var trim: Int
     private var examined = 0
@@ -43,7 +43,7 @@ final class MossTTSAudioStreamer {
         padCode: Int32,
         framesPerChunk: Int,
         decoder: @escaping () throws -> MossAudioDecodeStream,
-        emit: @escaping (MLXArray) -> Void
+        emit: @escaping (sending MLXArray) -> Void
     ) {
         self.startIndex = startIndex
         self.trim = trim
